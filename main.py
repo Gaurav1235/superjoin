@@ -9,7 +9,12 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
+import google.generativeai as genai
 import json
+
+from dotenv import load_dotenv
+
+load_dotenv() 
 
 DATA_DIR = "data"
 INDEX_PATH = os.path.join(DATA_DIR, "index.faiss")
@@ -30,6 +35,16 @@ app.add_middleware(
 
 model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
+# Gemini client for query rewriting
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY not set in environment")
+
+genai.configure(api_key=GEMINI_API_KEY)
+
+# choose a lightweight model, e.g. gemini-1.5-flash
+gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+
 faiss_index = None           # type: faiss.IndexFlatIP | None
 doc_store: List[Dict[str, Any]] = []   # parallel to the index vectors
 index_dim: int | None = None
@@ -47,6 +62,7 @@ class SearchResult(BaseModel):
 
 class SearchResponse(BaseModel):
     query: str
+    expanded_query: str
     results: List[SearchResult]
 
 
@@ -155,6 +171,33 @@ def load_state():
         print("No existing index/doc_store found.")
 
 load_state()
+
+def expand_query(query: str) -> str:
+    """
+    Use Gemini to rewrite and expand the user's query with
+    synonyms, related business terms, and equivalent phrases.
+    If anything fails, return the original query.
+    """
+    prompt = (
+        "You rewrite short search queries to make them easier "
+        "to match in a semantic search engine over spreadsheets.\n\n"
+        "Task: Expand the user's query by adding synonyms, equivalent business terms, "
+        "and time period equivalents (e.g., revenue/sales/income, "
+        "Q1/first quarter/Jan–Mar), but keep it within 1–2 sentences.\n\n"
+        "Important: Do NOT answer the query; only rewrite it as an expanded query "
+        "suitable for semantic search.\n\n"
+        f"Original query: {query}"
+    )
+
+    try:
+        response = gemini_model.generate_content(prompt)
+        expanded = response.text.strip()
+        print(f"[query expansion] '{query}' -> '{expanded}'")
+        return expanded
+    except Exception as e:
+        print("Query expansion with Gemini failed, using original query:", e)
+        return query
+
 # --- API endpoints ---
 
 @app.post("/upload")
@@ -240,9 +283,13 @@ async def search(query: str = Query(..., description="Natural language query"),
     if faiss_index is None or not doc_store:
         raise HTTPException(status_code=400, detail="No index available. Upload a spreadsheet first.")
 
-    # embed query
-    query_vec = embed_texts([query])
-    # search
+    # 1) Rewrite / expand query using Gemini
+    expanded_query = expand_query(query)
+
+    # 2) Embed the expanded query
+    query_vec = embed_texts([expanded_query])
+
+    # 3) Search FAISS
     scores, indices = faiss_index.search(query_vec, k)
     scores = scores[0]
     indices = indices[0]
@@ -263,7 +310,28 @@ async def search(query: str = Query(..., description="Natural language query"),
             )
         )
 
-    return SearchResponse(query=query, results=results)
+    return SearchResponse(
+        query=query,
+        expanded_query=expanded_query,
+        results=results,
+    )
+
+@app.post("/reset")
+async def reset_index():
+    global faiss_index, doc_store, index_dim
+
+    # Clear in-memory state
+    faiss_index = None
+    doc_store = []
+    index_dim = None
+
+    # Delete files if they exist
+    if os.path.exists(INDEX_PATH):
+        os.remove(INDEX_PATH)
+    if os.path.exists(DOCS_PATH):
+        os.remove(DOCS_PATH)
+
+    return {"message": "Index and document store cleared. You can upload a new file now."}
 
 
 @app.get("/")

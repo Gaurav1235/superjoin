@@ -5,3 +5,5 @@ openpyxl          # for .xlsx
 faiss-cpu
 sentence-transformers
 python-multipart  # for file uploads in FastAPI
+google-generativeai
+python-dotenv
