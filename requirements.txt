@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pandas
+openpyxl          # for .xlsx
+faiss-cpu
+sentence-transformers
+python-multipart  # for file uploads in FastAPI
