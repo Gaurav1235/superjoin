@@ -9,6 +9,11 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
+import json
+
+DATA_DIR = "data"
+INDEX_PATH = os.path.join(DATA_DIR, "index.faiss")
+DOCS_PATH = os.path.join(DATA_DIR, "doc_store.json")
 
 app = FastAPI(title="Semantic Spreadsheet Search")
 
@@ -108,7 +113,48 @@ def embed_texts(texts: List[str]) -> np.ndarray:
     vectors = vectors / norms
     return vectors
 
+def save_state():
+    """
+    Save FAISS index and doc_store to disk.
+    """
+    global faiss_index, doc_store
 
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    if faiss_index is not None:
+        faiss.write_index(faiss_index, INDEX_PATH)
+
+    # doc_store can contain non-JSON-native types (like numpy types, timestamps, etc.)
+    # default=str will convert them to strings.
+    with open(DOCS_PATH, "w", encoding="utf-8") as f:
+        json.dump(doc_store, f, ensure_ascii=False, default=str)
+
+
+def load_state():
+    """
+    Load FAISS index and doc_store from disk if they exist.
+    """
+    global faiss_index, doc_store, index_dim
+
+    if os.path.exists(INDEX_PATH) and os.path.exists(DOCS_PATH):
+        try:
+            faiss_index_local = faiss.read_index(INDEX_PATH)
+            with open(DOCS_PATH, "r", encoding="utf-8") as f:
+                doc_store_local = json.load(f)
+
+            faiss_index = faiss_index_local
+            doc_store = doc_store_local
+            index_dim = faiss_index.d
+            print(f"Loaded existing index with {len(doc_store)} docs, dim={index_dim}")
+        except Exception as e:
+            print("Failed to load existing index/doc_store:", e)
+            faiss_index = None
+            doc_store = []
+            index_dim = None
+    else:
+        print("No existing index/doc_store found.")
+
+load_state()
 # --- API endpoints ---
 
 @app.post("/upload")
@@ -172,6 +218,8 @@ async def upload_spreadsheet(file: UploadFile = File(...)):
     faiss_index = build_faiss_index(embeddings)
     index_dim = embeddings.shape[1]
     doc_store = docs
+
+    save_state()
 
     return {
         "message": "Index built successfully",
