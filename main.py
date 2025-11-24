@@ -1,7 +1,7 @@
 from typing import List, Dict, Any
 import os
 import uuid
-
+import re
 import faiss
 import numpy as np
 import pandas as pd
@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 import json
+import openpyxl
 
 from dotenv import load_dotenv
 
@@ -68,30 +69,186 @@ class SearchResponse(BaseModel):
 
 # --- Helper functions ---
 
-def create_documents_from_excel(file_path: str) -> List[Dict[str, Any]]:
+# ---------- Formula + cell semantics helpers ----------
+
+CELL_REF_RE = re.compile(
+    r"(?:'(?P<sheet>[^']+)'[.!])?(?P<col>\$?[A-Z]+)(?P<row>\$?\d+)"
+)
+
+
+def column_letter_to_index(col_letters: str) -> int:
     """
-    Parse the Excel file into a list of 'documents'.
-    Each document corresponds to one row (across all sheets).
+    'A' -> 1, 'B' -> 2, ..., 'AA' -> 27
     """
-    xls = pd.ExcelFile(file_path)
-    docs: List[Dict[str, Any]] = []
+    result = 0
+    for ch in col_letters:
+        result = result * 26 + (ord(ch) - ord("A") + 1)
+    return result  # 1-based
+
+
+def parse_cell_ref(ref: str, current_sheet: str):
+    """
+    Parse things like:
+      B5
+      $B$5
+      '3-Year Forecast'!B5
+      $'3-Year Forecast'.$B$5   (Google Sheets export sometimes)
+    into (sheet_name, row_index, col_index).
+
+    Returns None if it can't parse.
+    """
+    m = CELL_REF_RE.search(ref.strip())
+    if not m:
+        return None
+
+    sheet = m.group("sheet") or current_sheet
+    col_letters = m.group("col").replace("$", "")
+    row = int(m.group("row").replace("$", ""))
+
+    col = column_letter_to_index(col_letters)
+    return sheet, row, col
+
+
+def build_cell_semantics(xls: pd.ExcelFile) -> dict:
+    """
+    Build a mapping:
+        (sheet_name, excel_row, excel_col) -> "RowLabel for ColumnHeader"
+
+    Assumes:
+      - First row in the sheet is the header row (row 1 in Excel).
+      - First column is a row label (like 'Revenue', 'Operating Expenses', etc.).
+    """
+    semantics: dict[tuple[str, int, int], str] = {}
 
     for sheet_name in xls.sheet_names:
         df = xls.parse(sheet_name)
+        if df.empty:
+            continue
 
-        # ensure columns are strings
         df.columns = [str(c) for c in df.columns]
 
-        for idx, row in df.iterrows():
-            row_dict = row.to_dict()
+        # position 0 = row label column
+        row_label_col = df.columns[0]
 
-            # Build a text representation for semantic search
-            # "Sheet: Customers. Row: 5. Customer: ACME, Country: Germany, Status: Churned, MRR: 10000."
-            parts = [f"Sheet: {sheet_name}", f"Row: {idx}"]
-            for col_name, value in row_dict.items():
-                if pd.isna(value):
+        for idx, row in df.iterrows():
+            excel_row = idx + 2  # df row 0 -> Excel row 2
+
+            row_label = row.get(row_label_col)
+            if pd.isna(row_label):
+                continue
+
+            for col_pos, col_name in enumerate(df.columns):
+                excel_col = col_pos + 1  # df col 0 -> Excel col 1 (A)
+
+                # we skip the first column as a “data” cell, it's the label
+                if col_pos == 0:
                     continue
-                parts.append(f"{col_name}: {value}")
+
+                col_header = col_name
+                desc = f"{row_label} for {col_header}"
+                semantics[(sheet_name, excel_row, excel_col)] = desc
+
+    return semantics
+
+
+def describe_formula(formula: str, current_sheet: str, cell_semantics: dict) -> str | None:
+    """
+    For simple ratio formulas like:
+        =$'3-Year Forecast'.B5/$'3-Year Forecast'.B2
+    return a natural-language description using cell_semantics.
+    """
+    if not (isinstance(formula, str) and formula.startswith("=") and "/" in formula):
+        return None
+
+    expr = formula[1:]  # drop '='
+
+    # Very naive: split on the first '/'
+    try:
+        left_raw, right_raw = expr.split("/", 1)
+    except ValueError:
+        return None
+
+    left_ref = parse_cell_ref(left_raw, current_sheet)
+    right_ref = parse_cell_ref(right_raw, current_sheet)
+
+    if not left_ref or not right_ref:
+        return None
+
+    left_desc = cell_semantics.get(left_ref)
+    right_desc = cell_semantics.get(right_ref)
+
+    if not (left_desc and right_desc):
+        return None
+
+    sheet_left = left_ref[0]
+    sheet_right = right_ref[0]
+
+    if sheet_left == sheet_right:
+        sheet_phrase = f"from sheet {sheet_left}"
+    else:
+        sheet_phrase = f"from sheets {sheet_left} and {sheet_right}"
+
+    return f"ratio of {left_desc} divided by {right_desc} {sheet_phrase}"
+
+def create_documents_from_excel(file_path: str) -> list[dict]:
+    """
+    Parse an Excel file into a list of documents.
+
+    - One document per row (per sheet).
+    - Each cell is converted into text.
+    - If a cell contains a ratio formula like
+        =$'3-Year Forecast'.B5/$'3-Year Forecast'.B2
+      we append a semantic explanation, e.g.
+        "(ratio of Operating Expenses for Year 1 divided by Revenue for Year 1 from sheet 3-Year Forecast)".
+    """
+    xls = pd.ExcelFile(file_path)
+    wb = openpyxl.load_workbook(file_path, data_only=False)
+
+    # Build semantic descriptions for all referenced cells across all sheets
+    cell_semantics = build_cell_semantics(xls)
+
+    docs: list[dict] = []
+
+    for sheet_name in xls.sheet_names:
+        df = xls.parse(sheet_name)
+        if df.empty:
+            continue
+
+        df.columns = [str(c) for c in df.columns]
+        ws = wb[sheet_name]
+
+        for idx, row in df.iterrows():
+            excel_row = idx + 2  # df row 0 -> Excel row 2
+
+            row_raw = row.to_dict()
+            row_dict = {}
+            parts = [f"Sheet: {sheet_name}", f"Row: {idx}"]
+
+            # Optional: row label from first column
+            row_label_col = df.columns[0]
+            row_label = row.get(row_label_col)
+            if not pd.isna(row_label):
+                parts.append(f"Row label: {row_label}")
+
+            # Iterate over columns
+            for col_pos, (col_name, value) in enumerate(row_raw.items()):
+                if pd.isna(value):
+                    row_dict[col_name] = None
+                else:
+                    row_dict[col_name] = value
+
+                excel_col = col_pos + 1  # df col 0 -> Excel col 1 (A)
+                cell = ws.cell(row=excel_row, column=excel_col)
+                cell_raw = cell.value
+
+                explanation = None
+                if isinstance(cell_raw, str) and cell_raw.startswith("="):
+                    explanation = describe_formula(cell_raw, sheet_name, cell_semantics)
+
+                if explanation:
+                    parts.append(f"{col_name}: {value} ({explanation})")
+                else:
+                    parts.append(f"{col_name}: {value}")
 
             text = ". ".join(parts)
 
@@ -231,11 +388,14 @@ async def upload_spreadsheet(file: UploadFile = File(...)):
 
         docs: List[Dict[str, Any]] = []
         for idx, row in df.iterrows():
-            row_dict = row.to_dict()
+            row_raw = row.to_dict()
+            row_dict = {}
             parts = [f"Sheet: {file.filename}", f"Row: {idx}"]
-            for col_name, value in row_dict.items():
+            for col_name, value in row_raw.items():
                 if pd.isna(value):
-                    continue
+                    row_dict[col_name] = None
+                else:
+                    row_dict[col_name] = value
                 parts.append(f"{col_name}: {value}")
             text = ". ".join(parts)
             docs.append(
