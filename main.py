@@ -150,45 +150,105 @@ def build_cell_semantics(xls: pd.ExcelFile) -> dict:
 
     return semantics
 
+def classify_formula_type(formula: str) -> list[str]:
+    """
+    Return high-level tags describing what kind of formula this is.
+    Used so semantic search can answer queries like:
+      - "percentage calculations"
+      - "average formulas"
+      - "conditional calculations"
+      - "lookup formulas"
+    """
+    tags: list[str] = []
+    f = formula.upper()
+
+    # --- Percentage calculations ---
+    # Heuristics:
+    # - ratio-style formulas (a/b)
+    # - OR explicit *100 or /100
+    if "/" in f or "*100" in f or "/100" in f:
+        tags.append("percentage calculation")
+
+    # --- Average formulas ---
+    if "AVERAGE(" in f:
+        tags.append("average formula")
+    # SUM(...) / COUNT(...)
+    if "SUM(" in f and "COUNT(" in f and "/" in f:
+        if "average" not in " ".join(tags):
+            tags.append("average formula")
+
+    # --- Conditional calculations ---
+    if "IF(" in f or "IFS(" in f or "SUMIF(" in f or "COUNTIF(" in f or "SUMIFS(" in f or "COUNTIFS(" in f:
+        tags.append("conditional calculation")
+
+    # --- Lookup formulas ---
+    if "VLOOKUP(" in f or "HLOOKUP(" in f or "XLOOKUP(" in f:
+        tags.append("lookup formula")
+    # INDEX/MATCH combo
+    if "INDEX(" in f and "MATCH(" in f:
+        if "lookup formula" not in " ".join(tags):
+            tags.append("lookup formula")
+
+    return tags
+
 
 def describe_formula(formula: str, current_sheet: str, cell_semantics: dict) -> str | None:
     """
-    For simple ratio formulas like:
-        =$'3-Year Forecast'.B5/$'3-Year Forecast'.B2
-    return a natural-language description using cell_semantics.
+    For simple ratio formulas, generate a semantic explanation.
+    Also append high-level tags like "percentage calculation",
+    "average formula", "conditional calculation", "lookup formula"
+    based on the formula text.
     """
-    if not (isinstance(formula, str) and formula.startswith("=") and "/" in formula):
+    if not (isinstance(formula, str) and formula.startswith("=")):
         return None
 
-    expr = formula[1:]  # drop '='
+    base_explanation = None
 
-    # Very naive: split on the first '/'
-    try:
-        left_raw, right_raw = expr.split("/", 1)
-    except ValueError:
-        return None
+    # ----- Semantic ratio explanation (your previous behavior) -----
+    expr = formula[1:]
+    if "/" in expr:
+        try:
+            left_raw, right_raw = expr.split("/", 1)
+        except ValueError:
+            left_raw, right_raw = None, None
 
-    left_ref = parse_cell_ref(left_raw, current_sheet)
-    right_ref = parse_cell_ref(right_raw, current_sheet)
+        if left_raw and right_raw:
+            left_ref = parse_cell_ref(left_raw.strip(), current_sheet)
+            right_ref = parse_cell_ref(right_raw.strip(), current_sheet)
 
-    if not left_ref or not right_ref:
-        return None
+            if left_ref and right_ref:
+                left_desc = cell_semantics.get(left_ref)
+                right_desc = cell_semantics.get(right_ref)
 
-    left_desc = cell_semantics.get(left_ref)
-    right_desc = cell_semantics.get(right_ref)
+                if left_desc and right_desc:
+                    sheet_left = left_ref[0]
+                    sheet_right = right_ref[0]
+                    if sheet_left == sheet_right:
+                        sheet_phrase = f"from sheet {sheet_left}"
+                    else:
+                        sheet_phrase = f"from sheets {sheet_left} and {sheet_right}"
+                    base_explanation = (
+                        f"ratio of {left_desc} divided by {right_desc} {sheet_phrase}"
+                    )
 
-    if not (left_desc and right_desc):
-        return None
+    # ----- Functional tags (percentage / average / conditional / lookup) -----
+    tags = classify_formula_type(formula)
+    tag_text = ""
+    if tags:
+        # e.g. "[percentage calculation, conditional calculation]"
+        tag_text = " [" + ", ".join(tags) + "]"
 
-    sheet_left = left_ref[0]
-    sheet_right = right_ref[0]
+    # If we had a semantic explanation, append tags to it.
+    if base_explanation:
+        return base_explanation + tag_text
 
-    if sheet_left == sheet_right:
-        sheet_phrase = f"from sheet {sheet_left}"
-    else:
-        sheet_phrase = f"from sheets {sheet_left} and {sheet_right}"
+    # If we had no semantic interpretation (not a simple ratio),
+    # but still have tags, just return the tags.
+    if tags:
+        return "Formula type:" + tag_text
 
-    return f"ratio of {left_desc} divided by {right_desc} {sheet_phrase}"
+    # If no interpretation at all, return None so caller can fall back.
+    return None
 
 def create_documents_from_excel(file_path: str) -> list[dict]:
     """
@@ -218,6 +278,9 @@ def create_documents_from_excel(file_path: str) -> list[dict]:
         ws = wb[sheet_name]
 
         for idx, row in df.iterrows():
+            if row.isna().all():
+                continue
+
             excel_row = idx + 2  # df row 0 -> Excel row 2
 
             row_raw = row.to_dict()
