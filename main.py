@@ -12,6 +12,8 @@ from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 import json
 import openpyxl
+from typing import List, Dict, Any
+import json
 
 from dotenv import load_dotenv
 
@@ -392,6 +394,98 @@ def load_state():
 
 load_state()
 
+def llm_rerank(
+    query: str,
+    expanded_query: str,
+    candidates: List[Dict[str, Any]],
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    """
+    Re-rank FAISS candidates using Gemini.
+
+    `candidates` is a list of dicts like:
+      { "idx": <int>, "text": <str>, "sheet": <str>, "row_index": <int>, ... }
+
+    Returns the same dicts, but re-ordered, truncated to top_k.
+    """
+    if not candidates:
+        return []
+
+    # Build a compact list to feed the LLM (truncate text to keep prompt small)
+    llm_items = []
+    for i, cand in enumerate(candidates):
+        llm_items.append(
+            {
+                "id": i,
+                "sheet": cand.get("sheet"),
+                "row_index": cand.get("row_index"),
+                "text": cand.get("text", "")[:600],  # truncate
+            }
+        )
+
+    items_json = json.dumps(llm_items, ensure_ascii=False)
+
+    prompt = f"""
+You are re-ranking spreadsheet rows for a semantic search engine.
+
+The user asked:
+- Original query: {query}
+- Expanded semantic query: {expanded_query}
+
+You are given a list of candidate rows from the spreadsheet.
+Each item has:
+- id: an integer
+- sheet: sheet name
+- row_index: row index in that sheet
+- text: textual description of the row (including column names and values)
+
+Your task:
+1. Read all candidates carefully.
+2. Rank them from MOST relevant to LEAST relevant for answering the user's query.
+3. Return ONLY a JSON list of ids in best-first order, like:
+   [3, 0, 2, 1]
+
+Here are the candidates as JSON:
+
+{items_json}
+"""
+
+    try:
+        response = gemini_model.generate_content(prompt)
+        raw = response.text.strip()
+
+        # Try to extract JSON list from response
+        start = raw.find("[")
+        end = raw.rfind("]")
+        if start == -1 or end == -1:
+            raise ValueError("No JSON list found in LLM output")
+
+        json_str = raw[start : end + 1]
+        id_list = json.loads(json_str)
+
+        if not isinstance(id_list, list):
+            raise ValueError("Parsed JSON is not a list")
+
+        # Map ids back to candidates, preserving only valid ones
+        id_to_cand = {i: cand for i, cand in enumerate(candidates)}
+        reranked = []
+        for i in id_list:
+            if i in id_to_cand:
+                reranked.append(id_to_cand[i])
+
+        # If model returned fewer than candidates, append the rest in original order
+        seen_idxs = {c["idx"] for c in reranked}
+        for cand in candidates:
+            if cand["idx"] not in seen_idxs:
+                reranked.append(cand)
+
+        return reranked[:top_k]
+
+    except Exception as e:
+        print("LLM re-ranking failed, using FAISS order:", e)
+        # fallback: just return original FAISS order, truncated
+        return candidates[:top_k]
+
 def expand_query(query: str) -> str:
     """
     Use Gemini to rewrite and expand the user's query with
@@ -496,40 +590,63 @@ async def upload_spreadsheet(file: UploadFile = File(...)):
 
 
 @app.get("/search", response_model=SearchResponse)
-async def search(query: str = Query(..., description="Natural language query"),
-                 k: int = Query(5, ge=1, le=50)):
-    """
-    Search the current index using a natural language query.
-    """
+async def search(
+    query: str = Query(..., description="Natural language query"),
+    k: int = Query(5, ge=1, le=50),
+):
     global faiss_index, doc_store
 
     if faiss_index is None or not doc_store:
-        raise HTTPException(status_code=400, detail="No index available. Upload a spreadsheet first.")
+        raise HTTPException(
+            status_code=400,
+            detail="No index available. Upload a spreadsheet first.",
+        )
 
-    # 1) Rewrite / expand query using Gemini
+    # 1) Expand query with Gemini
     expanded_query = expand_query(query)
 
-    # 2) Embed the expanded query
+    # 2) Embed expanded query and retrieve a larger candidate pool from FAISS
+    faiss_k = max(k, 20)  # get more for reranking
     query_vec = embed_texts([expanded_query])
-
-    # 3) Search FAISS
-    scores, indices = faiss_index.search(query_vec, k)
+    scores, indices = faiss_index.search(query_vec, faiss_k)
     scores = scores[0]
     indices = indices[0]
 
-    results: List[SearchResult] = []
-
+    # 3) Build candidate list (dicts) for reranking
+    candidates: List[Dict[str, Any]] = []
     for score, idx in zip(scores, indices):
         if idx < 0 or idx >= len(doc_store):
             continue
         doc = doc_store[idx]
+        candidates.append(
+            {
+                "idx": int(idx),              # index into doc_store
+                "faiss_score": float(score),  # you can keep this for debugging
+                "sheet": doc.get("sheet"),
+                "row_index": doc.get("row_index"),
+                "row_data": doc.get("row_data"),
+                "text": doc.get("text", ""),
+            }
+        )
+
+    # 4) Re-rank using LLM
+    reranked = llm_rerank(
+        query=query,
+        expanded_query=expanded_query,
+        candidates=candidates,
+        top_k=k,
+    )
+
+    # 5) Convert reranked dicts into SearchResult objects
+    results: List[SearchResult] = []
+    for cand in reranked:
         results.append(
             SearchResult(
-                score=float(score),
-                sheet=doc["sheet"],
-                row_index=doc["row_index"],
-                row_data=doc["row_data"],
-                text=doc["text"],
+                score=cand.get("faiss_score", 0.0),  # or drop if you don't care
+                sheet=cand.get("sheet"),
+                row_index=cand.get("row_index"),
+                row_data=cand.get("row_data"),
+                text=cand.get("text", ""),
             )
         )
 
