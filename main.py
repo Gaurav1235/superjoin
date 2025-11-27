@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 import json
+import math
 import openpyxl
 from typing import List, Dict, Any
 import json
@@ -253,62 +254,85 @@ def describe_formula(formula: str, current_sheet: str, cell_semantics: dict) -> 
     return None
 
 def create_documents_from_excel(file_path: str) -> list[dict]:
-    """
-    Parse an Excel file into a list of documents.
-
-    - One document per row (per sheet).
-    - Each cell is converted into text.
-    - If a cell contains a ratio formula like
-        =$'3-Year Forecast'.B5/$'3-Year Forecast'.B2
-      we append a semantic explanation, e.g.
-        "(ratio of Operating Expenses for Year 1 divided by Revenue for Year 1 from sheet 3-Year Forecast)".
-    """
     xls = pd.ExcelFile(file_path)
     wb = openpyxl.load_workbook(file_path, data_only=False)
-
-    # Build semantic descriptions for all referenced cells across all sheets
-    cell_semantics = build_cell_semantics(xls)
 
     docs: list[dict] = []
 
     for sheet_name in xls.sheet_names:
-        df = xls.parse(sheet_name)
+        ws = wb[sheet_name]
+
+        # 1) Read the raw sheet WITHOUT assuming header row
+        df_raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
+
+        # 2) Find the first non-empty row → treat as header row
+        non_empty_rows = df_raw.notna().any(axis=1)
+        if not non_empty_rows.any():
+            continue  # sheet is empty
+
+        header_idx = non_empty_rows.idxmax()          # 0-based pandas index
+        header_row = df_raw.loc[header_idx]
+
+        valid_cols = header_row.notna()
+        df_raw = df_raw.loc[:, valid_cols]
+        header_row = header_row.loc[valid_cols]
+
+        # 3) Data rows start after header_idx (can have blank rows above)
+        df = df_raw.loc[header_idx + 1 :]
+
+        # drop fully blank rows in the data region (like your row 6)
+        df = df[df.notna().any(axis=1)]
+
+        # keep original indices so we can map back to Excel rows
+        # (pandas index 0 → Excel row 1)
+        df.columns = header_row.astype(str)
+
         if df.empty:
             continue
 
+        # 4) Normalize column names to strings
         df.columns = [str(c) for c in df.columns]
-        ws = wb[sheet_name]
 
+        # 5) Iterate rows and build docs
         for idx, row in df.iterrows():
-            if row.isna().all():
-                continue
+            # idx is the ORIGINAL pandas index -> Excel row = idx + 1
+            excel_row = idx + 1  # 0-based → 1-based Excel row number
 
-            excel_row = idx + 2  # df row 0 -> Excel row 2
-
+            # sanitize NaNs in row_data
             row_raw = row.to_dict()
             row_dict = {}
-            parts = [f"Sheet: {sheet_name}", f"Row: {idx}"]
+            for col_name, value in row_raw.items():
+                if isinstance(value, float):
+                    try:
+                        if math.isnan(value):
+                            value = None
+                    except Exception:
+                        pass
+                row_dict[col_name] = value
 
-            # Optional: row label from first column
-            row_label_col = df.columns[0]
-            row_label = row.get(row_label_col)
-            if not pd.isna(row_label):
+            parts = [f"Sheet: {sheet_name}", f"Row: {excel_row}"]
+
+            # add row label if you treat first column as label (optional)
+            first_col = df.columns[0]
+            row_label = row_dict.get(first_col)
+            if row_label is not None:
                 parts.append(f"Row label: {row_label}")
 
-            # Iterate over columns
-            for col_pos, (col_name, value) in enumerate(row_raw.items()):
-                if pd.isna(value):
-                    row_dict[col_name] = None
-                else:
-                    row_dict[col_name] = value
+            # go over columns and optionally read formulas
+            for col_pos, (col_name, value) in enumerate(row_dict.items(), start=1):
+                if value is None:
+                    continue
 
-                excel_col = col_pos + 1  # df col 0 -> Excel col 1 (A)
+                # Excel column = col_pos (since df_raw/header mirror the worksheet)
+                excel_col = col_pos
+
                 cell = ws.cell(row=excel_row, column=excel_col)
-                cell_raw = cell.value
+                formula = cell.value if isinstance(cell.value, str) and cell.value.startswith("=") else None
 
                 explanation = None
-                if isinstance(cell_raw, str) and cell_raw.startswith("="):
-                    explanation = describe_formula(cell_raw, sheet_name, cell_semantics)
+                if formula is not None:
+                    # keep your existing describe_formula(...) here if you have it
+                    explanation = describe_formula(formula, sheet_name, cell_semantics={})  # or just None for now
 
                 if explanation:
                     parts.append(f"{col_name}: {value} ({explanation})")
@@ -319,9 +343,9 @@ def create_documents_from_excel(file_path: str) -> list[dict]:
 
             docs.append(
                 {
-                    "id": f"{sheet_name}_{idx}",
+                    "id": f"{sheet_name}_r{excel_row}",
                     "sheet": sheet_name,
-                    "row_index": int(idx),
+                    "row_index": int(excel_row),
                     "row_data": row_dict,
                     "text": text,
                 }
