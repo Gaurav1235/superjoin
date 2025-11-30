@@ -14,7 +14,6 @@ import json
 import math
 import openpyxl
 from typing import List, Dict, Any
-import json
 
 from dotenv import load_dotenv
 
@@ -67,7 +66,8 @@ class SearchResult(BaseModel):
 class SearchResponse(BaseModel):
     query: str
     expanded_query: str
-    results: List[SearchResult]
+    faiss_results: List[SearchResult]
+    final_results: List[SearchResult]
 
 
 # --- Helper functions ---
@@ -253,6 +253,88 @@ def describe_formula(formula: str, current_sheet: str, cell_semantics: dict) -> 
     # If no interpretation at all, return None so caller can fall back.
     return None
 
+def detect_header_rows_with_llm(df_raw: pd.DataFrame, sheet_name: str) -> list[int]:
+    """
+    Use Gemini to detect which row indices (0-based) are header rows in this sheet.
+
+    Strategy:
+    - Build a compact preview of the sheet (row index + cell strings).
+    - Ask LLM to return JSON: {"header_rows": [int, int, ...]}.
+    - Fallback to [] on failure (caller can then use heuristics).
+    """
+    # Build a preview to avoid sending huge sheets
+    max_rows = min(60, df_raw.shape[0])
+    max_cols = min(20, df_raw.shape[1])
+
+    preview_rows = []
+    for idx in range(max_rows):
+        row_vals = df_raw.iloc[idx, :max_cols].tolist()
+        # convert to strings, keep empties as ""
+        cells = ["" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v) for v in row_vals]
+        # skip completely empty preview rows to save tokens
+        if all(c == "" for c in cells):
+            continue
+        preview_rows.append({
+            "row_index": int(idx),   # 0-based pandas index (Excel row = idx+1)
+            "cells": cells,
+        })
+
+    if not preview_rows:
+        return []
+
+    preview_json = json.dumps(preview_rows, ensure_ascii=False)
+
+    prompt = f"""
+You are analyzing an Excel sheet named '{sheet_name}'.
+
+You are given a list of rows from the sheet. Each row has:
+- row_index: 0-based index (0 means Excel row 1, 1 means Excel row 2, etc.)
+- cells: list of cell values in that row as strings.
+
+Your task:
+1. Decide which rows are HEADER rows for tables in this sheet.
+2. A header row usually:
+   - Contains column names (mostly text, not just numbers).
+   - Is followed by rows that look like data (numbers, dates, repeated patterns).
+3. There may be MULTIPLE tables in a single sheet.
+4. Return ONLY JSON with this schema:
+
+{{
+  "header_rows": [<int>, <int>, ...]
+}}
+
+Rules:
+- Use 0-based indices (same as row_index in the input).
+- Do NOT include any explanation text outside the JSON.
+- If no header rows found, return {{"header_rows": []}}.
+
+Here are the rows:
+
+{preview_json}
+"""
+
+    try:
+        response = gemini_model.generate_content(prompt)
+        raw = response.text.strip()
+
+        # Extract JSON object
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1:
+            raise ValueError("No JSON object found in LLM output")
+
+        json_str = raw[start : end + 1]
+        obj = json.loads(json_str)
+        hdrs = obj.get("header_rows", [])
+        if not isinstance(hdrs, list):
+            raise ValueError("header_rows is not a list")
+        # ensure ints and sort
+        header_rows = sorted(int(h) for h in hdrs)
+        return header_rows
+    except Exception as e:
+        print(f"[LLM header detection] failed for sheet '{sheet_name}', falling back. Error:", e)
+        return []  # caller falls back to heuristic
+
 def create_documents_from_excel(file_path: str) -> list[dict]:
     xls = pd.ExcelFile(file_path)
     wb = openpyxl.load_workbook(file_path, data_only=False)
@@ -262,94 +344,160 @@ def create_documents_from_excel(file_path: str) -> list[dict]:
     for sheet_name in xls.sheet_names:
         ws = wb[sheet_name]
 
-        # 1) Read the raw sheet WITHOUT assuming header row
+        # 1) Read raw sheet WITHOUT header
         df_raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
 
-        # 2) Find the first non-empty row → treat as header row
-        non_empty_rows = df_raw.notna().any(axis=1)
-        if not non_empty_rows.any():
-            continue  # sheet is empty
-
-        header_idx = non_empty_rows.idxmax()          # 0-based pandas index
-        header_row = df_raw.loc[header_idx]
-
-        valid_cols = header_row.notna()
-        df_raw = df_raw.loc[:, valid_cols]
-        header_row = header_row.loc[valid_cols]
-
-        # 3) Data rows start after header_idx (can have blank rows above)
-        df = df_raw.loc[header_idx + 1 :]
-
-        # drop fully blank rows in the data region (like your row 6)
-        df = df[df.notna().any(axis=1)]
-
-        # keep original indices so we can map back to Excel rows
-        # (pandas index 0 → Excel row 1)
-        df.columns = header_row.astype(str)
-
-        if df.empty:
+        if df_raw.empty:
             continue
 
-        # 4) Normalize column names to strings
-        df.columns = [str(c) for c in df.columns]
+        # 2) Ask LLM which rows are headers (0-based indices)
+        header_rows = detect_header_rows_with_llm(df_raw, sheet_name)
 
-        # 5) Iterate rows and build docs
-        for idx, row in df.iterrows():
-            # idx is the ORIGINAL pandas index -> Excel row = idx + 1
-            excel_row = idx + 1  # 0-based → 1-based Excel row number
+        # Fallback: if LLM found nothing, use first non-empty row as a single header
+        if not header_rows:
+            non_empty_rows = df_raw.notna().any(axis=1)
+            if not non_empty_rows.any():
+                continue  # sheet is empty
+            header_rows = [int(non_empty_rows.idxmax())]
 
-            # sanitize NaNs in row_data
-            row_raw = row.to_dict()
-            row_dict = {}
-            for col_name, value in row_raw.items():
-                if isinstance(value, float):
-                    try:
-                        if math.isnan(value):
-                            value = None
-                    except Exception:
-                        pass
-                row_dict[col_name] = value
+        header_rows = sorted(header_rows)
 
-            parts = [f"Sheet: {sheet_name}", f"Row: {excel_row}"]
+        # 3) For each header row, treat everything below it until the next header row as that table's data
+        max_row_idx = df_raw.index.max()
+        table_id = 0
 
-            # add row label if you treat first column as label (optional)
-            first_col = df.columns[0]
-            row_label = row_dict.get(first_col)
-            if row_label is not None:
-                parts.append(f"Row label: {row_label}")
+        for i, header_idx in enumerate(header_rows):
+            # next header (exclusive end); if this is last, then go to end of sheet
+            if i + 1 < len(header_rows):
+                next_header_idx = header_rows[i + 1]
+            else:
+                next_header_idx = max_row_idx + 1  # until end
 
-            # go over columns and optionally read formulas
-            for col_pos, (col_name, value) in enumerate(row_dict.items(), start=1):
-                if value is None:
+            # slice this vertical segment
+            # NOTE: we include header_idx itself here and then split header/data
+            segment = df_raw.loc[header_idx: next_header_idx - 1]
+
+            if segment.empty:
+                continue
+
+            # header row (first row of the segment)
+                        # header row (first row of the segment)
+            header_row = segment.iloc[0]
+
+            # 🔥 keep any column that has data somewhere in this segment
+            # (not just in the header row)
+            nonempty_cols = segment.notna().any(axis=0)
+            segment = segment.loc[:, nonempty_cols]
+
+            # 🔥 KEEP ORIGINAL EXCEL COLUMN INDICES
+            # these are 0-based: 0 -> col A, 1 -> col B, ...
+            orig_excel_cols = list(segment.columns)
+
+            # recompute header & data after column filtering
+            header_row = segment.iloc[0]
+            data_df = segment.iloc[1:]
+
+            # we allow blank rows inside the table but skip them when creating docs
+            # (blank rows do NOT break the table)
+            if data_df.empty:
+                table_id += 1
+                continue
+
+            # 🔧 build column names:
+            # - if header cell is non-empty -> use it
+            # - if header cell is empty but data is numeric -> call it "Value"
+            # - otherwise -> generic "Column {i}"
+            col_names = []
+            for j, col_idx in enumerate(orig_excel_cols):
+                header_val = header_row.iloc[j]
+                if header_val is not None and not (
+                    isinstance(header_val, float) and math.isnan(header_val)
+                ):
+                    col_names.append(str(header_val))
+                else:
+                    col_data = data_df.iloc[:, j]
+                    if pd.api.types.is_numeric_dtype(col_data):
+                        col_names.append("Value")
+                    else:
+                        col_names.append(f"Column {j + 1}")
+
+            data_df.columns = col_names
+
+
+            # 4) Iterate over rows in this table block
+            for idx, row in data_df.iterrows():
+                # idx is original pandas index -> Excel row = idx + 1
+                excel_row = int(idx) + 1
+
+                # skip fully blank rows (optional)
+                if row.isna().all():
                     continue
 
-                # Excel column = col_pos (since df_raw/header mirror the worksheet)
-                excel_col = col_pos
+                # sanitize NaNs in row_data
+                row_raw = row.to_dict()
+                row_dict: dict = {}
+                for col_name, value in row_raw.items():
+                    if isinstance(value, float):
+                        try:
+                            if math.isnan(value):
+                                value = None
+                        except Exception:
+                            pass
+                    row_dict[col_name] = value
 
-                cell = ws.cell(row=excel_row, column=excel_col)
-                formula = cell.value if isinstance(cell.value, str) and cell.value.startswith("=") else None
+                parts = [
+                    f"Sheet: {sheet_name}",
+                    f"Table: {table_id}",
+                    f"Row: {excel_row}",
+                ]
 
-                explanation = None
-                if formula is not None:
-                    # keep your existing describe_formula(...) here if you have it
-                    explanation = describe_formula(formula, sheet_name, cell_semantics={})  # or just None for now
+                # optional: row label from first column
+                first_col = data_df.columns[0]
+                row_label = row_dict.get(first_col)
+                if row_label is not None:
+                    parts.append(f"Row label: {row_label}")
 
-                if explanation:
-                    parts.append(f"{col_name}: {value} ({explanation})")
-                else:
-                    parts.append(f"{col_name}: {value}")
+                # iterate columns and optionally read formulas
+                for (col_name, value), orig_col_idx in zip(row_dict.items(), orig_excel_cols):
+                    if value is None:
+                        continue
 
-            text = ". ".join(parts)
+                    # Since df_raw/header mirror the worksheet structure,
+                    # we map col_pos -> Excel column index.
+                    # orig_col_idx is 0-based; Excel columns are 1-based
+                    excel_col = int(orig_col_idx) + 1
 
-            docs.append(
-                {
-                    "id": f"{sheet_name}_r{excel_row}",
-                    "sheet": sheet_name,
-                    "row_index": int(excel_row),
-                    "row_data": row_dict,
-                    "text": text,
-                }
-            )
+                    cell = ws.cell(row=excel_row, column=excel_col)
+                    formula = (
+                        cell.value
+                        if isinstance(cell.value, str) and cell.value.startswith("=")
+                        else None
+                    )
+
+                    explanation = None
+                    if formula is not None:
+                        # NOTE: you can pass a real cell_semantics map here if you built one
+                        explanation = describe_formula(formula, sheet_name, cell_semantics={})
+
+                    if explanation:
+                        parts.append(f"{col_name}: {value} ({explanation})")
+                    else:
+                        parts.append(f"{col_name}: {value}")
+
+                text = ". ".join(parts)
+
+                docs.append(
+                    {
+                        "id": f"{sheet_name}_t{table_id}_r{excel_row}",
+                        "sheet": sheet_name,
+                        "table": table_id,
+                        "row_index": excel_row,
+                        "row_data": row_dict,
+                        "text": text,
+                    }
+                )
+
+            table_id += 1  # next table for the next header
 
     return docs
 
@@ -626,58 +774,71 @@ async def search(
             detail="No index available. Upload a spreadsheet first.",
         )
 
-    # 1) Expand query with Gemini
+    # 1️⃣ Expand query with Gemini
     expanded_query = expand_query(query)
 
-    # 2) Embed expanded query and retrieve a larger candidate pool from FAISS
-    faiss_k = max(k, 20)  # get more for reranking
+    # 2️⃣ FAISS search - get larger pool for reranking
+    faiss_k = max(k, 20)
     query_vec = embed_texts([expanded_query])
     scores, indices = faiss_index.search(query_vec, faiss_k)
     scores = scores[0]
     indices = indices[0]
 
-    # 3) Build candidate list (dicts) for reranking
-    candidates: List[Dict[str, Any]] = []
+    # 3️⃣ Convert FAISS retrieved rows into structured format
+    faiss_results_list = []
+    candidate_payload = []  # used by reranker
+
     for score, idx in zip(scores, indices):
         if idx < 0 or idx >= len(doc_store):
             continue
         doc = doc_store[idx]
-        candidates.append(
+
+        item = SearchResult(
+            score=float(score),
+            sheet=doc["sheet"],
+            row_index=doc["row_index"],
+            row_data=doc["row_data"],
+            text=doc["text"],
+        )
+        faiss_results_list.append(item)
+
+        candidate_payload.append(
             {
-                "idx": int(idx),              # index into doc_store
-                "faiss_score": float(score),  # you can keep this for debugging
-                "sheet": doc.get("sheet"),
-                "row_index": doc.get("row_index"),
-                "row_data": doc.get("row_data"),
-                "text": doc.get("text", ""),
+                "idx": len(candidate_payload),
+                "faiss_score": float(score),
+                "sheet": doc["sheet"],
+                "row_index": doc["row_index"],
+                "row_data": doc["row_data"],
+                "text": doc["text"],
             }
         )
 
-    # 4) Re-rank using LLM
+    # 4️⃣ LLM ranking
     reranked = llm_rerank(
         query=query,
         expanded_query=expanded_query,
-        candidates=candidates,
+        candidates=candidate_payload,
         top_k=k,
     )
 
-    # 5) Convert reranked dicts into SearchResult objects
-    results: List[SearchResult] = []
+    # 5️⃣ Convert reranked items back to SearchResult
+    final_results_list = []
     for cand in reranked:
-        results.append(
+        final_results_list.append(
             SearchResult(
-                score=cand.get("faiss_score", 0.0),  # or drop if you don't care
+                score=cand.get("faiss_score", 0.0),
                 sheet=cand.get("sheet"),
                 row_index=cand.get("row_index"),
                 row_data=cand.get("row_data"),
-                text=cand.get("text", ""),
+                text=cand.get("text"),
             )
         )
 
     return SearchResponse(
         query=query,
         expanded_query=expanded_query,
-        results=results,
+        faiss_results=faiss_results_list[:k],   # show top-k FAISS before reranking
+        final_results=final_results_list,       # after LLM reranking
     )
 
 @app.post("/reset")

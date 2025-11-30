@@ -1,23 +1,6 @@
-{"category": "formula_understanding", "query": "expense ratio for year 1", "expected_keywords": ["Expense Ratio", "ratio", "Operating Expenses for Year 1", "Revenue for Year 1"]}
-{"category": "formula_understanding", "query": "operating expenses divided by revenue", "expected_keywords": ["Expense Ratio", "Operating Expenses", "Revenue", "ratio"]}
-{"category": "formula_understanding", "query": "what percentage of revenue is spent on operating expenses in year 1", "expected_keywords": ["Expense Ratio", "Operating Expenses for Year 1", "Revenue for Year 1", "%"]}
-{"category": "formula_understanding", "query": "gross margin percentage for year 1", "expected_keywords": ["Gross Margin", "Year 1", "margin", "%"]}
-{"category": "formula_understanding", "query": "operating margin year 1", "expected_keywords": ["Operating Margin", "Year 1", "margin", "Operating Income", "Revenue"]}
-
-{"category": "business_concepts", "query": "Q1 revenue", "expected_keywords": ["Q1", "Quarter 1", "Jan", "Feb", "Mar", "Revenue"]}
-{"category": "business_concepts", "query": "first quarter sales", "expected_keywords": ["Q1", "Quarter 1", "Revenue", "Sales"]}
-{"category": "business_concepts", "query": "jan to mar income", "expected_keywords": ["Q1", "Jan", "Feb", "Mar", "income", "revenue", "sales"]}
-{"category": "business_concepts", "query": "topline for year 1", "expected_keywords": ["Revenue for Year 1", "topline", "sales"]}
-{"category": "business_concepts", "query": "profitability ratio for the first year", "expected_keywords": ["Operating Margin", "Gross Margin", "Year 1", "ratio"]}
-
-{"category": "cross_sheet", "query": "operating expenses in 3-year forecast for year 1", "expected_keywords": ["3-Year Forecast", "Operating Expenses for Year 1"]}
-{"category": "cross_sheet", "query": "revenue from 3-year forecast feeding into financial ratios", "expected_keywords": ["3-Year Forecast", "Revenue for Year 1", "Financial Ratios"]}
-{"category": "cross_sheet", "query": "how are financial ratios calculated from the forecast sheet", "expected_keywords": ["Financial Ratios", "3-Year Forecast", "ratio", "Operating Expenses", "Revenue"]}
-{"category": "cross_sheet", "query": "year 2 expense ratio based on forecast data", "expected_keywords": ["Expense Ratio", "Year 2", "3-Year Forecast", "Operating Expenses for Year 2", "Revenue for Year 2"]}
-{"category": "cross_sheet", "query": "show metrics that depend on 3-Year Forecast sheet", "expected_keywords": ["3-Year Forecast", "Financial Ratios", "ratio", "margin", "Expense Ratio"]}
-
-{"category": "general_semantic", "query": "which year looks most profitable", "expected_keywords": ["Gross Margin", "Operating Margin", "Year", "profitability"]}
-{"category": "general_semantic", "query": "where do we spend the most on operating expenses", "expected_keywords": ["Operating Expenses", "highest", "Year"]}
-{"category": "general_semantic", "query": "compare revenue and operating expenses over three years", "expected_keywords": ["Revenue", "Operating Expenses", "Year 1", "Year 2", "Year 3"]}
-{"category": "general_semantic", "query": "show all key financial ratios", "expected_keywords": ["Financial Ratios", "Gross Margin", "Operating Margin", "Expense Ratio"]}
-{"category": "general_semantic", "query": "is our cost structure improving over time", "expected_keywords": ["Expense Ratio", "Operating Margin", "Year 1", "Year 2", "Year 3"]}
+{"category": "sales", "query": "which person has the highest performance and in which region", "expected_keywords": ["Alice Smith", "Region: North", "Performance %", "1.125"]}
+{"category": "revenue", "query": "what is the total revenue in April 2024", "expected_keywords": ["Sales Overview", "2024-04-01", "Actual Revenue", "140000"]}
+{"category": "customer", "query": "which customer is most valuable", "expected_keywords": ["Customer Analysis", "Epsilon Co", "Revenue", "52000"]}
+{"category": "sales", "query": "who did maximum sales in north ?", "expected_keywords": ["Sales Overview", "Alice Smith", "Region: North", "Actual Sales", "135000"]}
+{"category": "sales", "query": "who is the best performer ?", "expected_keywords": ["Sales Overview", "Alice Smith", "Region: North", "Actual Sales", "135000", "Performance %", "1.125"]}
+{"category": "pipeline_analysis", "query": "which is the deal won ?", "expected_keywords": ["Pipeline Analysis", "Epsilon Cross-sell", "Stage: Closed Won", "Owner: Evan Chen", "Value", "22000", "Probability %", "100"]}

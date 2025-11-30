@@ -11,7 +11,7 @@ def eval_case(case):
     q = case["query"]
     res = requests.get(f"{API_URL}/search", params={"query": q, "k": 3}).json()
 
-    if not res["results"]:
+    if not res["final_results"]:
         return {
             "query": q,
             "category": case.get("category"),
@@ -21,7 +21,7 @@ def eval_case(case):
             "expected_keywords": case["expected_keywords"],
         }
 
-    top = res["results"][0]["text"]
+    top = res["final_results"][0]["text"]
     keywords = case["expected_keywords"]
 
     passed = contains_any(top, keywords)
